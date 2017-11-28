@@ -32,12 +32,12 @@ final class HttpClusterBootstrapRoutes(settings: ClusterBootstrapSettings) exten
 
       // TODO add a method to find oldest to cluster state?
       val oldest = state.members.toSeq
-        .filter(node => node.status == MemberStatus.Up && node.dataCenter == cluster.selfDataCenter)
+        .filter(node => node.status == MemberStatus.Up)
         .sorted(Member.ageOrdering)
         .headOption // we are only interested in the oldest one that is still Up
         .map(_.uniqueAddress.address)
 
-      val info = SeedNodes(cluster.selfMember.uniqueAddress.address, members, oldest)
+      val info = SeedNodes(cluster.selfAddress, members, oldest)
       log.info("Bootstrap request from {}: Contact Point returning {} seed-nodes ([{}])", clientIp, members.size,
         members)
       complete(info)

@@ -5,13 +5,12 @@ package akka.cluster.bootstrap.dns
 
 import java.util.concurrent.ThreadLocalRandom
 
-import akka.actor.{ Actor, ActorLogging, ActorRef, Props, Timers }
+import akka.actor.{ Actor, ActorLogging, ActorRef, Props }
 import akka.annotation.InternalApi
 import akka.cluster.Cluster
 import akka.cluster.bootstrap.ClusterBootstrapSettings
 import akka.cluster.bootstrap.contactpoint.HttpBootstrapJsonProtocol.SeedNodes
 import akka.cluster.bootstrap.contactpoint.{ ClusterBootstrapRequests, HttpBootstrapJsonProtocol }
-import akka.compat.Future
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshalling.Marshal
 import akka.http.scaladsl.model.{ HttpMethods, HttpRequest, Uri }
@@ -19,8 +18,9 @@ import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.pattern.pipe
 import akka.stream.ActorMaterializer
 import akka.util.PrettyDuration
-
 import scala.concurrent.duration._
+
+import akka.actor.Cancellable
 
 @InternalApi
 private[dns] object HttpContactPointBootstrap {
@@ -31,6 +31,7 @@ private[dns] object HttpContactPointBootstrap {
   object Protocol {
     object Internal {
       final case class ProbeNow()
+      case object ScheduledProbeNow
       final case class ContactPointProbeResponse()
     }
   }
@@ -51,7 +52,6 @@ private[dns] class HttpContactPointBootstrap(
     baseUri: Uri
 ) extends Actor
     with ActorLogging
-    with Timers
     with HttpBootstrapJsonProtocol {
 
   import HttpContactPointBootstrap._
@@ -70,8 +70,6 @@ private[dns] class HttpContactPointBootstrap(
   private val http = Http()(context.system)
   import context.dispatcher
 
-  private val ProbingTimerKey = "probing-key"
-
   private val probeInterval = settings.contactPoint.probeInterval
 
   /**
@@ -80,15 +78,25 @@ private[dns] class HttpContactPointBootstrap(
    */
   private val existingClusterNotObservedWithinDeadline: Deadline = settings.contactPoint.noSeedsStableMargin.fromNow
 
+  private var timerTask: Option[Cancellable] = None
+
   override def preStart(): Unit =
     self ! Internal.ProbeNow()
 
+  override def postStop(): Unit = {
+    timerTask.foreach(_.cancel())
+    super.postStop()
+  }
+
   override def receive = {
     case Internal.ProbeNow() ⇒
-      val req = ClusterBootstrapRequests.bootstrapSeedNodes(baseUri)
-      log.info("Probing {} for seed nodes...", req.uri)
+      probeNow()
 
-      http.singleRequest(req).flatMap(res ⇒ Unmarshal(res).to[SeedNodes]).pipeTo(self)
+    case Internal.ScheduledProbeNow ⇒
+      if (timerTask.isDefined) {
+        probeNow()
+        timerTask = None
+      }
 
     case response @ SeedNodes(node, members, oldest) ⇒
       if (members.isEmpty) {
@@ -119,6 +127,13 @@ private[dns] class HttpContactPointBootstrap(
       }
   }
 
+  private def probeNow(): Unit = {
+    val req = ClusterBootstrapRequests.bootstrapSeedNodes(baseUri)
+    log.info("Probing {} for seed nodes...", req.uri)
+
+    http.singleRequest(req).flatMap(res ⇒ Unmarshal(res).to[SeedNodes]).pipeTo(self)
+  }
+
   private def clusterNotObservedWithinDeadline: Boolean =
     existingClusterNotObservedWithinDeadline.isOverdue()
 
@@ -137,8 +152,12 @@ private[dns] class HttpContactPointBootstrap(
       seedAddresses)
   }
 
-  private def scheduleNextContactPointProbing(): Unit =
-    timers.startSingleTimer(ProbingTimerKey, Internal.ProbeNow(), effectiveProbeInterval())
+  private def scheduleNextContactPointProbing(): Unit = {
+    // this re-scheduling of timer tasks might not be completely safe, e.g. in case of restarts, but should
+    // be good enough for the Akka 2.4 release. In the Akka 2.5 release we are using Timers.
+    timerTask.foreach(_.cancel())
+    timerTask = Some(context.system.scheduler.scheduleOnce(effectiveProbeInterval(), self, Internal.ScheduledProbeNow))
+  }
 
   /** Duration with configured jitter applied */
   private def effectiveProbeInterval(): FiniteDuration =
