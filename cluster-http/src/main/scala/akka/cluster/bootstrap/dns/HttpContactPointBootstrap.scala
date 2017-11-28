@@ -21,6 +21,7 @@ import akka.util.PrettyDuration
 import scala.concurrent.duration._
 
 import akka.actor.Cancellable
+import akka.actor.Status
 
 @InternalApi
 private[dns] object HttpContactPointBootstrap {
@@ -72,6 +73,8 @@ private[dns] class HttpContactPointBootstrap(
 
   private val probeInterval = settings.contactPoint.probeInterval
 
+  private val probeRequest = ClusterBootstrapRequests.bootstrapSeedNodes(baseUri)
+
   /**
    * If we don't observe any seed-nodes until the deadline triggers, we notify the parent about it,
    * such that it may make the decision to join this node to itself or not (initiating a new cluster).
@@ -97,6 +100,12 @@ private[dns] class HttpContactPointBootstrap(
         probeNow()
         timerTask = None
       }
+
+    case Status.Failure(cause) =>
+      log.error("Probing {} failed due to {}", probeRequest.uri, cause.getMessage)
+
+      // keep probing, hoping the request will eventually succeed
+      scheduleNextContactPointProbing()
 
     case response @ SeedNodes(node, members, oldest) ⇒
       if (members.isEmpty) {
@@ -128,10 +137,13 @@ private[dns] class HttpContactPointBootstrap(
   }
 
   private def probeNow(): Unit = {
-    val req = ClusterBootstrapRequests.bootstrapSeedNodes(baseUri)
-    log.info("Probing {} for seed nodes...", req.uri)
+    log.info("Probing {} for seed nodes...", probeRequest.uri)
 
-    http.singleRequest(req).flatMap(res ⇒ Unmarshal(res).to[SeedNodes]).pipeTo(self)
+    http
+      .singleRequest(probeRequest)
+      .flatMap(_.entity.toStrict(settings.contactPoint.probeTimeout))
+      .flatMap(res ⇒ Unmarshal(res).to[SeedNodes])
+      .pipeTo(self)
   }
 
   private def clusterNotObservedWithinDeadline: Boolean =
